@@ -20,7 +20,6 @@ else:
     from torch.optim import Adam
     from torch.optim import SGD
 
-
 from megatron import get_args
 from megatron.model import LayerNorm
 
@@ -33,22 +32,22 @@ def _get_params_for_weight_decay_optimization(modules):
     """
     args = get_args()
 
-    weight_decay_params = {'params': [], 'name' : 'weight_decay_params'}
+    weight_decay_params = {'params': [], 'name': 'weight_decay_params'}
     no_weight_decay_params = {'params': [], 'weight_decay': 0.0, 'name': 'no_weight_decay_params'}
-    
+
     for module in modules:
         for module_ in module.modules():
             if isinstance(module_, LayerNorm):
                 no_weight_decay_params['params'].extend(
                     [p for p in list(module_._parameters.values())
-                    if p is not None])
+                     if p is not None])
             else:
                 weight_decay_params['params'].extend(
                     [p for n, p in list(module_._parameters.items())
-                    if p is not None and n != 'bias'])
+                     if p is not None and n != 'bias'])
                 no_weight_decay_params['params'].extend(
                     [p for n, p in list(module_._parameters.items())
-                    if p is not None and n == 'bias'])
+                     if p is not None and n == 'bias'])
     return weight_decay_params, no_weight_decay_params
 
 def get_megatron_optimizer(model):
@@ -59,7 +58,7 @@ def get_megatron_optimizer(model):
     if args.create_moe_param_group:
         from deepspeed.moe.utils import is_moe_param, split_params_into_different_moe_groups_for_optimizer
         param_groups = split_params_into_different_moe_groups_for_optimizer(param_groups)
-    
+
     if args.cpu_optimizer:
         assert args.optimizer == 'adam', 'CPU offloading is for Adam'
         if args.cpu_torch_adam:
@@ -73,18 +72,36 @@ def get_megatron_optimizer(model):
     else:
         if args.optimizer == 'adam':
             optimizer = Adam(param_groups,
-                            lr=args.lr,
-                            weight_decay=args.weight_decay,
-                            betas=(args.adam_beta1, args.adam_beta2),
-                            eps=args.adam_eps)
+                             lr=args.lr,
+                             weight_decay=args.weight_decay,
+                             betas=(args.adam_beta1, args.adam_beta2),
+                             eps=args.adam_eps)
         elif args.optimizer == 'sgd':
             optimizer = SGD(param_groups,
                             lr=args.lr,
                             weight_decay=args.weight_decay,
                             momentum=args.sgd_momentum)
+        elif args.optimizer == 'lionw':
+            from megatron.optimizer.lion_optimizer import DecoupledLionW
+            optimizer = DecoupledLionW(param_groups,
+                                       lr=args.lr,
+                                       weight_decay=args.weight_decay,
+                                       betas=(args.adam_beta1, args.adam_beta2))
+        elif args.optimizer == 'adalrlion':
+            from megatron.optimizer.lion_optimizer import DecoupledAdaLRLion
+            optimizer = DecoupledAdaLRLion(param_groups,
+                                           lr=args.lr,
+                                           weight_decay=args.weight_decay,
+                                           betas=(args.adam_beta1, args.adam_beta2))
+        elif args.optimizer == 'cliplion':
+            from megatron.optimizer.lion_optimizer import DecoupledClipLion
+            optimizer = DecoupledClipLion(param_groups,
+                                          lr=args.lr,
+                                          weight_decay=args.weight_decay,
+                                          betas=(args.adam_beta1, args.adam_beta2))
         else:
             raise Exception('{} optimizer is not supported.'.format(
-            args.optimizer))
+                args.optimizer))
 
     if args.deepspeed:
         return optimizer

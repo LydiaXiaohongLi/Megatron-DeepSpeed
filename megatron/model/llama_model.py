@@ -1,23 +1,3 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""
-Llama model.
-Following implementation from huggingface, https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py
-"""
-
 import math
 from functools import partial
 
@@ -809,8 +789,8 @@ def CrossEntropy(output, labels):
     return loss
 
 
-class LlamaModelPipe(PipelineModule, MegatronModule):
-    """llama Language model."""
+class GPTModelPipe(PipelineModule, MegatronModule):
+    """Llama Language model."""
 
     def __init__(self, parallel_output=True):
         args = get_args()
@@ -832,7 +812,8 @@ class LlamaModelPipe(PipelineModule, MegatronModule):
         self.specs.append(_to_float16)
 
         # Embedding layer
-        self.specs.append(LayerSpec(LlamaEmbeddingPipe, hidden_size=args.hidden_size, vocab_size=args.padded_vocab_size,
+        padded_vocab_size = 32000  # TODO add in args, and take into consideration of padding token
+        self.specs.append(LayerSpec(LlamaEmbeddingPipe, hidden_size=args.hidden_size, vocab_size=padded_vocab_size,
                                     init_method=self.init_method, ))
 
         if args.fp32_residual_connection:
@@ -880,7 +861,7 @@ class LlamaModelPipe(PipelineModule, MegatronModule):
 
 
 class LlamaModel(MegatronModule):
-    """llama Language model."""
+    """Llama Language model."""
 
     def __init__(self, pre_process, post_process, parallel_output=True, add_pooler=False):
         super(LlamaModel, self).__init__()
@@ -894,7 +875,7 @@ class LlamaModel(MegatronModule):
         self.init_method = init_method_normal(args.init_method_std)
         self.output_layer_init_method = scaled_init_method_normal(args.init_method_std, args.num_layers)
         self.self_attn_mask_type = AttnMaskType.causal
-        self.padded_vocab_size = args.padded_vocab_size
+        self.padded_vocab_size = 32000  # TODO add in args, and take into consideration of padding token
 
         if self.pre_process:
             self.embedding = LlamaEmbedding(hidden_size=args.hidden_size,
