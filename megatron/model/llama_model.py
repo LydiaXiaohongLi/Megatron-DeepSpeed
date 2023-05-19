@@ -17,7 +17,58 @@ import deepspeed
 from deepspeed.accelerator import get_accelerator
 from deepspeed.pipe import PipelineModule, LayerSpec
 
+# ALiBi position embedding
+def build_alibi_tensor():
+    """
+    Link to paper: https://arxiv.org/abs/2108.12409 Alibi tensor is not causal as the original paper mentions, it
+    relies on a translation invariance of softmax for quick implementation: with l being a tensor, and a fixed value
+    `softmax(l+a) = softmax(l)`. Based on
+    https://github.com/ofirpress/attention_with_linear_biases/blob/a35aaca144e0eb6b789dfcb46784c4b8e31b7983/fairseq/models/transformer.py#L742
+    TODO @thomasw21 this doesn't work as nicely due to the masking strategy, and so masking varies slightly.
+    TODO may need handling for virtual pipeline parallel
+    Args:
+    """
+    args = get_args()
+    if args.fp16:
+        dtype = torch.float16
+    elif args.bf16:
+        dtype = torch.bfloat16
+    else:
+        dtype = torch.float32
+    device = get_accelerator().current_device_name()
+    closest_power_of_2 = 2 ** math.floor(math.log2(args.num_attention_heads))
+    base = torch.tensor(2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3))), dtype=torch.float32)
+    powers = torch.arange(1, 1 + closest_power_of_2, dtype=torch.int32)
+    slopes = torch.pow(base, powers)
 
+    if closest_power_of_2 != args.num_attention_heads:
+        extra_base = torch.tensor(
+            2 ** (-(2 ** -(math.log2(2 * closest_power_of_2) - 3))), dtype=torch.float32
+        )
+        num_remaining_heads = min(closest_power_of_2, args.num_attention_heads - closest_power_of_2)
+        extra_powers = torch.arange(1, 1 + 2 * num_remaining_heads, 2, dtype=torch.int32)
+        slopes = torch.cat([slopes, torch.pow(extra_base, extra_powers)], dim=0)
+
+    # Note: alibi will added to the attention bias that will be applied to the query, key product of attention
+    # => therefore alibi will have to be of shape (batch_size, num_heads, query_length, key_length)
+    # => here we set (batch_size=1, num_heads=num_heads, query_length=1, key_length=max_length)
+    # => the query_length dimension will then be broadcasted correctly
+    # This is more or less identical to T5's relative position bias:
+    # https://github.com/huggingface/transformers/blob/f681437203baa7671de3174b0fa583c349d9d5e1/src/transformers/models/t5/modeling_t5.py#L527
+
+    alibi = slopes.reshape(-1, 1) * torch.arange(args.seq_length-1).reshape(1, -1)
+    # batch_size=1, num_heads, query_length=1, key_length
+    alibi = alibi.to(device)[None,:,None,:].to(dtype)
+
+    # Note: alibi will added to the attention bias that will be applied to the query, key product of attention
+    # => therefore alibi will have to be of shape (batch_size, num_heads, query_length, key_length)
+    # => here we set (batch_size=1, num_heads=num_heads, query_length=1, key_length=max_length)
+    # => the query_length dimension will then be broadcasted correctly
+    # This is more or less identical to T5's relative position bias:
+    # https://github.com/huggingface/transformers/blob/f681437203baa7671de3174b0fa583c349d9d5e1/src/transformers/models/t5/modeling_t5.py#L527
+    return alibi
+
+# Rotary position embedding
 class RotaryEmbedding(torch.nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
@@ -288,6 +339,8 @@ class LlamaParallelAttention(MegatronModule):
         self.attn_mask_type = attn_mask_type
         self.init_method = init_method
         self.output_layer_init_method = output_layer_init_method
+        self.use_rotary_position_embeddings = args.use_rotary_position_embeddings
+        self.use_alibi_position_embeddings = args.use_alibi_position_embeddings
 
         self.num_attention_heads = args.num_attention_heads
         projection_size = args.kv_channels * args.num_attention_heads
@@ -300,6 +353,7 @@ class LlamaParallelAttention(MegatronModule):
             projection_size, args.num_attention_heads)
         self.num_attention_heads_per_partition = mpu.divide(
             args.num_attention_heads, world_size)
+        self.tensor_model_parallel_rank = mpu.get_tensor_model_parallel_rank()
 
         # Strided linear layer.
         if attention_type == AttnType.self_attn:
@@ -323,8 +377,13 @@ class LlamaParallelAttention(MegatronModule):
             self.attention_softmax_in_fp32,
             coeff)
 
-        ## Rotary Position Embedding
-        self.rotary_emb = RotaryEmbedding(self.hidden_size_per_attention_head)
+        ## Rotaryf Position Embedding
+        if args.use_rotary_position_embeddings:
+            self.rotary_emb = RotaryEmbedding(self.hidden_size_per_attention_head)
+        elif args.use_alibi_position_embeddings:
+            self.alibi_emb = args.alibi[:,self.tensor_model_parallel_rank*self.num_attention_heads_per_partition:(self.tensor_model_parallel_rank+1)*self.num_attention_heads_per_partition,:,:]
+            # b * np, 1, sq/sk
+            self.alibi_emb = self.alibi_emb.expand((args.micro_batch_size,-1,-1,-1)).reshape(args.micro_batch_size*self.num_attention_heads_per_partition,1,args.seq_length-1)
 
         # Output.
         self.dense = mpu.RowParallelLinear(
@@ -341,6 +400,8 @@ class LlamaParallelAttention(MegatronModule):
 
     def forward(self, hidden_states, attention_mask, layer_past=None,
                 get_key_value=False):
+        # TODO memory_efficient_attention from xformers to support alibi position embedding
+        # TODO to add in memory_efficient_attention from xformers
         # hidden_states: [sq, b, h]
 
         # =====================
@@ -365,17 +426,18 @@ class LlamaParallelAttention(MegatronModule):
         # Rotary Position Embedding
         # ==================================
         # [sq, b, np, hn] --> [b, np, sq, hn] TODO optimize the permute of dimension back and forth
-        query_layer = query_layer.permute(1, 2, 0, 3)
-        key_layer = key_layer.permute(1, 2, 0, 3)
-        value_layer = value_layer.permute(1, 2, 0, 3)
+        if self.use_rotary_position_embeddings:
+            query_layer = query_layer.permute(1, 2, 0, 3)
+            key_layer = key_layer.permute(1, 2, 0, 3)
+            value_layer = value_layer.permute(1, 2, 0, 3)
 
-        cos, sin = self.rotary_emb(value_layer, seq_len=new_tensor_shape[0])
-        query_layer, key_layer = apply_rotary_pos_emb(query_layer, key_layer, cos, sin, offset=0)
+            cos, sin = self.rotary_emb(value_layer, seq_len=new_tensor_shape[0])
+            query_layer, key_layer = apply_rotary_pos_emb(query_layer, key_layer, cos, sin, offset=0)
 
-        # [b, np, sq, hn] --> [sq, b, np, hn] TODO optimize the permute of dimension back and forth
-        query_layer = query_layer.permute(2, 0, 1, 3).contiguous()
-        key_layer = key_layer.permute(2, 0, 1, 3).contiguous()
-        value_layer = value_layer.permute(2, 0, 1, 3).contiguous()
+            # [b, np, sq, hn] --> [sq, b, np, hn] TODO optimize the permute of dimension back and forth
+            query_layer = query_layer.permute(2, 0, 1, 3).contiguous()
+            key_layer = key_layer.permute(2, 0, 1, 3).contiguous()
+            value_layer = value_layer.permute(2, 0, 1, 3).contiguous()
 
         # ==================================
         # Adjust key and value for inference
@@ -416,11 +478,20 @@ class LlamaParallelAttention(MegatronModule):
             device=get_accelerator().current_device_name())
 
         # Raw attention scores. [b * np, sq, sk]
-        matmul_result = torch.baddbmm(
-            matmul_result,
-            query_layer.transpose(0, 1),  # [b * np, sq, hn]
-            key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
-            beta=0.0, alpha=(1.0 / self.norm_factor))
+        if self.use_rotary_position_embeddings:
+            matmul_result = torch.baddbmm(
+                matmul_result,
+                query_layer.transpose(0, 1),  # [b * np, sq, hn]
+                key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
+                beta=0.0, alpha=(1.0 / self.norm_factor))
+        elif self.use_alibi_position_embeddings:
+            matmul_result = self.alibi_emb.baddbmm(
+                batch1=query_layer.transpose(0, 1),
+                batch2=key_layer.transpose(0, 1).transpose(1, 2),
+                beta=0.0,
+                alpha=(1.0 / self.norm_factor),
+            )
+
 
         # change view to [b, np, sq, sk]
         attention_scores = matmul_result.view(*output_size)
@@ -790,7 +861,7 @@ def CrossEntropy(output, labels):
 
 
 class GPTModelPipe(PipelineModule, MegatronModule):
-    """Llama Language model."""
+    """GPT-2 Language model."""
 
     def __init__(self, parallel_output=True):
         args = get_args()
@@ -861,7 +932,7 @@ class GPTModelPipe(PipelineModule, MegatronModule):
 
 
 class LlamaModel(MegatronModule):
-    """Llama Language model."""
+    """GPT-2 Language model."""
 
     def __init__(self, pre_process, post_process, parallel_output=True, add_pooler=False):
         super(LlamaModel, self).__init__()

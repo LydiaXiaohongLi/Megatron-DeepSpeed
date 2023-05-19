@@ -39,16 +39,23 @@ import wandb
 
 def wandb_init():
     args = get_args()
-    nnodes = 2
+    nnodes = 1
     zero_stage = 0
+
+    if args.use_rotary_position_embeddings:
+        group_name = f"{nnodes}node-8gpu-zs{zero_stage}-tp{args.tensor_model_parallel_size}-pp{args.pipeline_model_parallel_size}-bs{args.global_batch_size}-mbs{args.micro_batch_size}-rotary-{args.optimizer}-{strftime('%Y-%m-%d-%H-%M', gmtime())}"
+    elif args.use_alibi_position_embeddings:
+        group_name = f"{nnodes}node-8gpu-zs{zero_stage}-tp{args.tensor_model_parallel_size}-pp{args.pipeline_model_parallel_size}-bs{args.global_batch_size}-mbs{args.micro_batch_size}-alibi-{args.optimizer}-{strftime('%Y-%m-%d-%H-%M', gmtime())}"
+    else:
+        group_name = f"{nnodes}node-8gpu-zs{zero_stage}-tp{args.tensor_model_parallel_size}-pp{args.pipeline_model_parallel_size}-bs{args.global_batch_size}-mbs{args.micro_batch_size}-{args.optimizer}-{strftime('%Y-%m-%d-%H-%M', gmtime())}"
 
     # Wait so everyone is done (necessary)
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
     wandb.init(
-        project="llama-30b-c4-pretrain",
-        group=f"{nnodes}node-8gpu-zs{zero_stage}-tp{args.tensor_model_parallel_size}-pp{args.pipeline_model_parallel_size}-bs{args.global_batch_size}-mbs{args.micro_batch_size}-{strftime('%Y-%m-%d-%H-%M', gmtime())}",
+        project="llama-1b3-c4-pretrain",
+        group=group_name,
         job_type="exploration_memory_speed_profile",
         name=f"rank: {torch.distributed.get_rank()}",
         notes=f"{nnodes}node-8gpu-zs{zero_stage}-tp{args.tensor_model_parallel_size}-pp{args.pipeline_model_parallel_size}-bs{args.global_batch_size}-mbs{args.micro_batch_size}",
@@ -65,7 +72,9 @@ def wandb_init():
                 "pipeline-model-parallel-size": args.pipeline_model_parallel_size,
                 "zero-stage": zero_stage,
                 "nnodes": nnodes,
-                "nproc_per_node": 8}
+                "nproc_per_node": 8,
+                "use_rotary_position_embeddings": args.use_rotary_position_embeddings,
+                "use_alibi_position_embeddings": args.use_alibi_position_embeddings, }
     )
 
 
@@ -413,6 +422,10 @@ def model_provider_func(pre_process=True, post_process=True):
     """Build the model."""
 
     args = get_args()
+    if args.use_alibi_position_embeddings:
+        from megatron.model.llama_model import build_alibi_tensor
+        args.alibi = build_alibi_tensor()
+
     with deepspeed.zero.Init(data_parallel_group=mpu.get_data_parallel_group(),
                              remote_device=None if args.remote_device == 'none' else args.remote_device,
                              config_dict_or_path=args.deepspeed_config,
@@ -449,6 +462,7 @@ def model_provider_func(pre_process=True, post_process=True):
                 pre_process=pre_process,
                 post_process=post_process
             )
+
     return model
 
 
@@ -594,12 +608,10 @@ def pretrain():
         assert args.DDP_impl == 'local'
 
     ### get dataset ###
-    data_files = sorted(glob.glob("/home/team/xiaohong/llama_demo/data/tokenized_corpus_c4*"))[1:]
+    data_files = sorted(glob.glob("/home/team/xiaohong/llama_demo/data/tokenized_corpus_c4*"))
     train_dataset = ConcatDataset([MMapIndexedDataset(file) for file in data_files])
-    # TODO data_files should be pre shuffled, and data loader should load one by one in sequence, i.e. data should be determined by global_steps;
-    # TODO continue data loading from desired iteration
     # TODO Streaming data? so recover from failure is fast in loading data
-    train_dataloader = build_pretraining_data_loader(train_dataset, consumed_samples=0)
+    train_dataloader = build_pretraining_data_loader(train_dataset, consumed_samples=args.consumed_train_samples)
     train_data_iterator = iter(train_dataloader)
 
     ### Start Training ###
@@ -702,8 +714,7 @@ def pretrain():
         args.consumed_train_samples += new_samples
         args.consumed_train_tokens += new_samples * args.seq_length
 
-        if ((
-            iteration) % args.save_interval == 0) and args.save:  # TODO why pp=2, mp=2, dp=2, have 8 shards of optim_states?
+        if ((iteration) % args.save_interval == 0) and args.save:  # TODO why pp=2, mp=2, dp=2, have 8 shards of optim_states?
             save_checkpoint(iteration, model, optimizer, lr_scheduler)
 
     if ((iteration) % args.save_interval != 0) and args.save:
@@ -723,8 +734,7 @@ def init():
 # other curriculum_learning, compression_training?
 # Analyze training speed/memory performance: 1. all same, increasing batchsize, not increasing speed? 2. checkpoint-activations, distribute-checkpointed-activations not increasing speed?
 # https://github.com/microsoft/Megatron-DeepSpeed/issues/105, as such, many new improvements from megatron including sequence parallel, fast attention is not supported yet here...  probably shift to Megatron?
-# ALiBi positional embedding and not supported by megatron-deepspeed (or megatron) yet
-# Lion optimizer not supported by megatron-deepspeed (or megatron) yet. Only SGD and ADAM (using apex's Fused implementation)
+# flash attention is integrated to megatron (both training and inference), and deepspeed (only inference?)
 
 if __name__ == "__main__":
     init()
