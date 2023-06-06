@@ -629,7 +629,8 @@ def pretrain():
             loss = model[0].train_batch(data_iter=train_data_iterator)  # uses deepspeed pipeline parallel
             print(f"{datetime.now().strftime('%H:%M:%S')} iteration: {iteration}, losses_reduced: {loss}")
             iteration = iteration + 1
-            wandb.log({"loss": loss, "learning_rate": lr_scheduler.get_lr()})
+            if is_rank_0():
+                wandb.log({"loss": loss, "learning_rate": lr_scheduler.get_lr()})
         else:
             # Set grad to zero.
             if not args.deepspeed:
@@ -694,7 +695,8 @@ def pretrain():
                 print(
                     f"{datetime.now().strftime('%H:%M:%S')} iteration: {iteration}, losses_reduced: {losses_reduced[0]}")
                 iteration = iteration + 1
-                wandb.log({"loss": losses_reduced[0], "learning_rate": lr_scheduler.get_lr()})
+                if is_rank_0():
+                    wandb.log({"loss": losses_reduced[0], "learning_rate": lr_scheduler.get_lr()})
             else:
                 update_successful, _, _ = optimizer.step()
                 timers('optimizer').stop()
@@ -704,7 +706,8 @@ def pretrain():
                     print(
                         f"{datetime.now().strftime('%H:%M:%S')} iteration: {iteration}, losses_reduced: {losses_reduced[0]}")
                     iteration = iteration + 1
-                    wandb.log({"loss": losses_reduced[0], "learning_rate": lr_scheduler.get_lr()})
+                    if is_rank_0():
+                        wandb.log({"loss": losses_reduced[0], "learning_rate": lr_scheduler.get_lr()})
                 else:
                     print(
                         f"{datetime.now().strftime('%H:%M:%S')} iteration: {iteration}, updated failed, iteration skipped")
@@ -726,7 +729,8 @@ def init():
     initialize_megatron(args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
     args = get_args()
     print(f"{datetime.now().strftime('%H:%M:%S')} args: {args}")
-    wandb_init()
+    if is_rank_0():
+        wandb_init()
 
 
 # TODO
@@ -739,4 +743,5 @@ def init():
 if __name__ == "__main__":
     init()
     pretrain()
-    wandb.finish()
+    if is_rank_0():
+        wandb.finish()
